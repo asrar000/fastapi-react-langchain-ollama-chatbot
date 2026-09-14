@@ -17,13 +17,28 @@ class Settings:
             "OLLAMA_BASE_URL", "http://localhost:11434"
         ).strip()
         self.OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b").strip()
-        self._memory_window_raw = os.getenv("MEMORY_WINDOW_SIZE", "8").strip()
-        self.MEMORY_WINDOW_SIZE = 8
+        self.OLLAMA_EMBED_MODEL = os.getenv(
+            "OLLAMA_EMBED_MODEL", "nomic-embed-text"
+        ).strip()
         self.CORS_ORIGINS = [
             origin.strip()
             for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
             if origin.strip()
         ]
+
+        # Parsed and range-checked in validate().
+        self._ints = {
+            "MEMORY_WINDOW_SIZE": (os.getenv("MEMORY_WINDOW_SIZE", "8"), 8),
+            "CHUNK_SIZE": (os.getenv("CHUNK_SIZE", "1000"), 1000),
+            "CHUNK_OVERLAP": (os.getenv("CHUNK_OVERLAP", "150"), 150),
+            "RAG_TOP_K": (os.getenv("RAG_TOP_K", "4"), 4),
+            "MAX_UPLOAD_MB": (os.getenv("MAX_UPLOAD_MB", "5"), 5),
+        }
+        for name, (_, default) in self._ints.items():
+            setattr(self, name, default)
+
+        self._threshold_raw = os.getenv("RAG_MATCH_THRESHOLD", "0.3").strip()
+        self.RAG_MATCH_THRESHOLD = 0.3
 
     def validate(self) -> None:
         """Check configuration up front so bad setup fails at startup.
@@ -50,15 +65,33 @@ class Settings:
                 "(expected something like http://localhost:11434)"
             )
 
+        if not self.OLLAMA_EMBED_MODEL:
+            problems.append("OLLAMA_EMBED_MODEL is not set")
+
+        for name, (raw, _) in self._ints.items():
+            try:
+                value = int(raw)
+                if value < 1:
+                    raise ValueError
+                setattr(self, name, value)
+            except ValueError:
+                problems.append(f"{name} must be a positive integer, got {raw!r}")
+
+        if self.CHUNK_OVERLAP >= self.CHUNK_SIZE:
+            problems.append(
+                f"CHUNK_OVERLAP ({self.CHUNK_OVERLAP}) must be smaller than "
+                f"CHUNK_SIZE ({self.CHUNK_SIZE})"
+            )
+
         try:
-            window = int(self._memory_window_raw)
-            if window < 1:
+            threshold = float(self._threshold_raw)
+            if not 0.0 <= threshold <= 1.0:
                 raise ValueError
-            self.MEMORY_WINDOW_SIZE = window
+            self.RAG_MATCH_THRESHOLD = threshold
         except ValueError:
             problems.append(
-                f"MEMORY_WINDOW_SIZE must be a positive integer, "
-                f"got {self._memory_window_raw!r}"
+                "RAG_MATCH_THRESHOLD must be a number between 0 and 1, "
+                f"got {self._threshold_raw!r}"
             )
 
         if not self.CORS_ORIGINS:

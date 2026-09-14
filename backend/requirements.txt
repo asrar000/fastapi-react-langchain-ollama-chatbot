@@ -3,8 +3,10 @@ uvicorn[standard]==0.52.4
 langchain==1.4.0
 langchain-core==1.6.3
 langchain-ollama==1.1.0
+langchain-text-splitters==1.1.2
 supabase==2.31.0
 sse-starlette==3.4.11
 pydantic==2.13.5
 python-dotenv==1.2.3
 python-multipart==0.0.32
+pypdf==6.18.1

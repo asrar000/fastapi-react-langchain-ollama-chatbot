@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 import Sidebar from './components/Sidebar'
+import DocumentPanel from './components/DocumentPanel'
 import MessageList from './components/MessageList'
 import MessageInput from './components/MessageInput'
 import { useChat } from './hooks/useChat'
@@ -10,11 +11,15 @@ export default function App() {
     sessions,
     activeSessionId,
     messages,
+    documents,
     isStreaming,
+    uploadState,
     loadSessions,
     createSession,
     loadMessages,
     deleteSession,
+    uploadDocument,
+    deleteDocument,
     sendMessage,
   } = useChat()
 
@@ -32,6 +37,12 @@ export default function App() {
         onDeleteSession={deleteSession}
       />
       <div className="chat-canvas">
+        <DocumentPanel
+          documents={documents}
+          uploadState={uploadState}
+          onUpload={uploadDocument}
+          onDelete={deleteDocument}
+        />
         <MessageList messages={messages} isStreaming={isStreaming} />
         <MessageInput onSend={sendMessage} disabled={isStreaming} />
       </div>

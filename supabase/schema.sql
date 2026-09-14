@@ -1,10 +1,11 @@
 -- Run this in the Supabase SQL editor (Project > SQL Editor > New query).
+-- Safe to re-run: every statement is idempotent.
 
 create extension if not exists "uuid-ossp";
 create extension if not exists vector;
 
 -- One row per chat thread. `client_id` is the anonymous UUID the frontend
--- generates and stores in localStorage — there is no real auth here.
+-- generates and stores in localStorage — see the Security note in README.
 create table if not exists chat_sessions (
   id uuid primary key default uuid_generate_v4(),
   client_id uuid not null,
@@ -30,42 +31,72 @@ create index if not exists idx_messages_session
   on messages (session_id, created_at);
 
 -- ---------------------------------------------------------------------
--- Optional / stretch: RAG readiness. Not used by the base chat pipeline —
--- only needed if a document-upload + embeddings feature gets added later.
--- `vector(768)` assumes a 768-dim embedding model (e.g. nomic-embed-text
--- via Ollama); change the dimension to match whatever model you embed with.
+-- RAG: uploaded documents and their embedded chunks.
+--
+-- `vector(768)` matches nomic-embed-text, the default embedding model.
+-- If you switch embedding models, change the dimension here AND in the
+-- match_documents signature below, then re-upload your documents —
+-- embeddings from different models are not comparable.
 -- ---------------------------------------------------------------------
 
+-- One row per uploaded file, so the UI can list and delete whole documents.
+create table if not exists documents (
+  id uuid primary key default uuid_generate_v4(),
+  session_id uuid not null references chat_sessions (id) on delete cascade,
+  filename text not null,
+  chunk_count integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_documents_session
+  on documents (session_id, created_at desc);
+
+-- One row per embedded chunk. Cascades from both the document and session.
 create table if not exists document_chunks (
   id uuid primary key default uuid_generate_v4(),
-  session_id uuid references chat_sessions (id) on delete cascade,
+  document_id uuid not null references documents (id) on delete cascade,
+  session_id uuid not null references chat_sessions (id) on delete cascade,
   content text not null,
   embedding vector(768),
   metadata jsonb,
   created_at timestamptz not null default now()
 );
 
+create index if not exists idx_document_chunks_session
+  on document_chunks (session_id);
+
+-- IVFFlat index for cosine similarity. Only helps once there are enough
+-- rows; on a small demo dataset Postgres may still choose a sequential
+-- scan, which is fine and correct.
+create index if not exists idx_document_chunks_embedding
+  on document_chunks using ivfflat (embedding vector_cosine_ops)
+  with (lists = 100);
+
+-- Similarity search scoped to one session. `match_threshold` filters out
+-- weak matches so unrelated chunks don't get injected into the prompt.
 create or replace function match_documents (
   query_embedding vector(768),
   match_session_id uuid,
-  match_count int default 5
+  match_count int default 4,
+  match_threshold float default 0.3
 )
 returns table (
   id uuid,
   content text,
+  filename text,
   similarity float
 )
-language plpgsql
+language sql stable
 as $$
-begin
-  return query
   select
-    document_chunks.id,
-    document_chunks.content,
-    1 - (document_chunks.embedding <=> query_embedding) as similarity
-  from document_chunks
-  where document_chunks.session_id = match_session_id
-  order by document_chunks.embedding <=> query_embedding
+    dc.id,
+    dc.content,
+    d.filename,
+    1 - (dc.embedding <=> query_embedding) as similarity
+  from document_chunks dc
+  join documents d on d.id = dc.document_id
+  where dc.session_id = match_session_id
+    and 1 - (dc.embedding <=> query_embedding) > match_threshold
+  order by dc.embedding <=> query_embedding
   limit match_count;
-end;
 $$;

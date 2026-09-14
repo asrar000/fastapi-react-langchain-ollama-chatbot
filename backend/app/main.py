@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import check_connection
-from app.routers import chat, sessions
+from app.routers import chat, documents, sessions
 
 
 @asynccontextmanager
@@ -16,7 +16,10 @@ async def lifespan(app: FastAPI):
     # into a confusing 500 on someone's first message.
     settings.validate()
     await asyncio.to_thread(check_connection)
-    print(f"Config OK. Model: {settings.OLLAMA_MODEL} @ {settings.OLLAMA_BASE_URL}")
+    print(
+        f"Config OK. Chat model: {settings.OLLAMA_MODEL} | "
+        f"Embeddings: {settings.OLLAMA_EMBED_MODEL} @ {settings.OLLAMA_BASE_URL}"
+    )
     yield
 
 
@@ -31,6 +34,7 @@ app.add_middleware(
 )
 
 app.include_router(chat.router)
+app.include_router(documents.router)
 app.include_router(sessions.router)
 
 

@@ -20,12 +20,13 @@ mkdir -p \
 # ---- supabase/schema.sql ----
 cat > supabase/schema.sql << 'EOF_SUPABASE_SCHEMA_SQL_968064'
 -- Run this in the Supabase SQL editor (Project > SQL Editor > New query).
+-- Safe to re-run: every statement is idempotent.
 
 create extension if not exists "uuid-ossp";
 create extension if not exists vector;
 
 -- One row per chat thread. `client_id` is the anonymous UUID the frontend
--- generates and stores in localStorage — there is no real auth here.
+-- generates and stores in localStorage — see the Security note in README.
 create table if not exists chat_sessions (
   id uuid primary key default uuid_generate_v4(),
   client_id uuid not null,
@@ -51,44 +52,74 @@ create index if not exists idx_messages_session
   on messages (session_id, created_at);
 
 -- ---------------------------------------------------------------------
--- Optional / stretch: RAG readiness. Not used by the base chat pipeline —
--- only needed if a document-upload + embeddings feature gets added later.
--- `vector(768)` assumes a 768-dim embedding model (e.g. nomic-embed-text
--- via Ollama); change the dimension to match whatever model you embed with.
+-- RAG: uploaded documents and their embedded chunks.
+--
+-- `vector(768)` matches nomic-embed-text, the default embedding model.
+-- If you switch embedding models, change the dimension here AND in the
+-- match_documents signature below, then re-upload your documents —
+-- embeddings from different models are not comparable.
 -- ---------------------------------------------------------------------
 
+-- One row per uploaded file, so the UI can list and delete whole documents.
+create table if not exists documents (
+  id uuid primary key default uuid_generate_v4(),
+  session_id uuid not null references chat_sessions (id) on delete cascade,
+  filename text not null,
+  chunk_count integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_documents_session
+  on documents (session_id, created_at desc);
+
+-- One row per embedded chunk. Cascades from both the document and session.
 create table if not exists document_chunks (
   id uuid primary key default uuid_generate_v4(),
-  session_id uuid references chat_sessions (id) on delete cascade,
+  document_id uuid not null references documents (id) on delete cascade,
+  session_id uuid not null references chat_sessions (id) on delete cascade,
   content text not null,
   embedding vector(768),
   metadata jsonb,
   created_at timestamptz not null default now()
 );
 
+create index if not exists idx_document_chunks_session
+  on document_chunks (session_id);
+
+-- IVFFlat index for cosine similarity. Only helps once there are enough
+-- rows; on a small demo dataset Postgres may still choose a sequential
+-- scan, which is fine and correct.
+create index if not exists idx_document_chunks_embedding
+  on document_chunks using ivfflat (embedding vector_cosine_ops)
+  with (lists = 100);
+
+-- Similarity search scoped to one session. `match_threshold` filters out
+-- weak matches so unrelated chunks don't get injected into the prompt.
 create or replace function match_documents (
   query_embedding vector(768),
   match_session_id uuid,
-  match_count int default 5
+  match_count int default 4,
+  match_threshold float default 0.3
 )
 returns table (
   id uuid,
   content text,
+  filename text,
   similarity float
 )
-language plpgsql
+language sql stable
 as $$
-begin
-  return query
   select
-    document_chunks.id,
-    document_chunks.content,
-    1 - (document_chunks.embedding <=> query_embedding) as similarity
-  from document_chunks
-  where document_chunks.session_id = match_session_id
-  order by document_chunks.embedding <=> query_embedding
+    dc.id,
+    dc.content,
+    d.filename,
+    1 - (dc.embedding <=> query_embedding) as similarity
+  from document_chunks dc
+  join documents d on d.id = dc.document_id
+  where dc.session_id = match_session_id
+    and 1 - (dc.embedding <=> query_embedding) > match_threshold
+  order by dc.embedding <=> query_embedding
   limit match_count;
-end;
 $$;
 EOF_SUPABASE_SCHEMA_SQL_968064
 
@@ -98,9 +129,23 @@ SUPABASE_URL=https://your-project.supabase.co
 # Use the service_role key here (server-side only, never exposed to the
 # browser) — the frontend never talks to Supabase directly, only to this API.
 SUPABASE_KEY=your-service-role-key
+
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5-coder:7b
+# Embedding model for RAG. Pull it with: ollama pull nomic-embed-text
+# Produces 768-dim vectors, matching vector(768) in supabase/schema.sql.
+OLLAMA_EMBED_MODEL=nomic-embed-text
+
+# How many past messages to replay as conversation memory.
 MEMORY_WINDOW_SIZE=8
+
+# RAG tuning. CHUNK_OVERLAP must be smaller than CHUNK_SIZE.
+CHUNK_SIZE=1000
+CHUNK_OVERLAP=150
+RAG_TOP_K=4
+RAG_MATCH_THRESHOLD=0.3
+MAX_UPLOAD_MB=5
+
 CORS_ORIGINS=http://localhost:5173
 EOF_BACKEND__ENV_EXAMPLE_7F4301
 
@@ -111,11 +156,13 @@ uvicorn[standard]==0.52.4
 langchain==1.4.0
 langchain-core==1.6.3
 langchain-ollama==1.1.0
+langchain-text-splitters==1.1.2
 supabase==2.31.0
 sse-starlette==3.4.11
 pydantic==2.13.5
 python-dotenv==1.2.3
 python-multipart==0.0.32
+pypdf==6.18.1
 EOF_BACKEND_REQUIREMENTS_TXT_746768
 
 # ---- backend/app/__init__.py ----
@@ -142,13 +189,28 @@ class Settings:
             "OLLAMA_BASE_URL", "http://localhost:11434"
         ).strip()
         self.OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b").strip()
-        self._memory_window_raw = os.getenv("MEMORY_WINDOW_SIZE", "8").strip()
-        self.MEMORY_WINDOW_SIZE = 8
+        self.OLLAMA_EMBED_MODEL = os.getenv(
+            "OLLAMA_EMBED_MODEL", "nomic-embed-text"
+        ).strip()
         self.CORS_ORIGINS = [
             origin.strip()
             for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
             if origin.strip()
         ]
+
+        # Parsed and range-checked in validate().
+        self._ints = {
+            "MEMORY_WINDOW_SIZE": (os.getenv("MEMORY_WINDOW_SIZE", "8"), 8),
+            "CHUNK_SIZE": (os.getenv("CHUNK_SIZE", "1000"), 1000),
+            "CHUNK_OVERLAP": (os.getenv("CHUNK_OVERLAP", "150"), 150),
+            "RAG_TOP_K": (os.getenv("RAG_TOP_K", "4"), 4),
+            "MAX_UPLOAD_MB": (os.getenv("MAX_UPLOAD_MB", "5"), 5),
+        }
+        for name, (_, default) in self._ints.items():
+            setattr(self, name, default)
+
+        self._threshold_raw = os.getenv("RAG_MATCH_THRESHOLD", "0.3").strip()
+        self.RAG_MATCH_THRESHOLD = 0.3
 
     def validate(self) -> None:
         """Check configuration up front so bad setup fails at startup.
@@ -175,15 +237,33 @@ class Settings:
                 "(expected something like http://localhost:11434)"
             )
 
+        if not self.OLLAMA_EMBED_MODEL:
+            problems.append("OLLAMA_EMBED_MODEL is not set")
+
+        for name, (raw, _) in self._ints.items():
+            try:
+                value = int(raw)
+                if value < 1:
+                    raise ValueError
+                setattr(self, name, value)
+            except ValueError:
+                problems.append(f"{name} must be a positive integer, got {raw!r}")
+
+        if self.CHUNK_OVERLAP >= self.CHUNK_SIZE:
+            problems.append(
+                f"CHUNK_OVERLAP ({self.CHUNK_OVERLAP}) must be smaller than "
+                f"CHUNK_SIZE ({self.CHUNK_SIZE})"
+            )
+
         try:
-            window = int(self._memory_window_raw)
-            if window < 1:
+            threshold = float(self._threshold_raw)
+            if not 0.0 <= threshold <= 1.0:
                 raise ValueError
-            self.MEMORY_WINDOW_SIZE = window
+            self.RAG_MATCH_THRESHOLD = threshold
         except ValueError:
             problems.append(
-                f"MEMORY_WINDOW_SIZE must be a positive integer, "
-                f"got {self._memory_window_raw!r}"
+                "RAG_MATCH_THRESHOLD must be a number between 0 and 1, "
+                f"got {self._threshold_raw!r}"
             )
 
         if not self.CORS_ORIGINS:
@@ -267,6 +347,14 @@ class ChatRequest(BaseModel):
     session_id: UUID
     client_id: UUID
     message: str = Field(min_length=1, max_length=20000)
+
+
+class DocumentResponse(BaseModel):
+    id: UUID
+    session_id: UUID
+    filename: str
+    chunk_count: int
+    created_at: datetime
 EOF_BACKEND_APP_MODELS_PY_0FF144
 
 # ---- backend/app/routers/__init__.py ----
@@ -379,6 +467,7 @@ from app.database import get_supabase
 from app.models import ChatRequest
 from app.services.llm_service import stream_chat_response
 from app.services.memory_service import get_windowed_history
+from app.services.rag_service import format_context, retrieve_context
 from app.services.session_service import require_session_owner
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -407,6 +496,18 @@ def _touch_session(session_id: str, title: str | None = None):
     )
 
 
+def _has_documents(session_id: str) -> bool:
+    response = (
+        get_supabase()
+        .table("documents")
+        .select("id")
+        .eq("session_id", session_id)
+        .limit(1)
+        .execute()
+    )
+    return bool(response.data)
+
+
 def _title_from_first_message(message: str) -> str:
     text = message.strip().replace("\n", " ")
     return text[:50] + ("..." if len(text) > 50 else "")
@@ -426,6 +527,23 @@ async def chat_stream(payload: ChatRequest):
     history = await asyncio.to_thread(get_windowed_history, payload.session_id)
     is_first_message = len(history) == 0
 
+    # Only pay the embedding round-trip if this session actually has
+    # documents; a plain chat session skips retrieval entirely.
+    matches = []
+    if await asyncio.to_thread(_has_documents, session_id):
+        matches = await asyncio.to_thread(
+            retrieve_context, payload.session_id, user_message
+        )
+    context = format_context(matches)
+
+    sources = [
+        {
+            "filename": m.get("filename") or "document",
+            "similarity": round(float(m.get("similarity", 0)), 3),
+        }
+        for m in matches
+    ]
+
     # Store the user message before calling the LLM. If the local Ollama
     # call fails or the stream dies halfway, the prompt is already durable.
     await asyncio.to_thread(_insert_message, session_id, "user", user_message)
@@ -437,7 +555,11 @@ async def chat_stream(payload: ChatRequest):
     async def event_generator():
         full_response = ""
         try:
-            async for token in stream_chat_response(user_message, history):
+            # Tell the UI which chunks were used before tokens start arriving.
+            if sources:
+                yield {"event": "sources", "data": json.dumps({"sources": sources})}
+
+            async for token in stream_chat_response(user_message, history, context):
                 full_response += token
                 yield {"event": "token", "data": json.dumps({"content": token})}
 
@@ -459,6 +581,116 @@ async def chat_stream(payload: ChatRequest):
 
     return EventSourceResponse(event_generator())
 EOF_BACKEND_APP_ROUTERS_CHAT_PY_D796E1
+
+# ---- backend/app/routers/documents.py ----
+cat > backend/app/routers/documents.py << 'EOF_BACKEND_APP_ROUTERS_DOCUMENTS_PY_3C1F88'
+import asyncio
+from uuid import UUID
+
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+
+from app.config import settings
+from app.database import get_supabase
+from app.models import DocumentResponse
+from app.services.rag_service import (
+    SUPPORTED_EXTENSIONS,
+    DocumentError,
+    ingest_document,
+)
+from app.services.session_service import require_session_owner
+
+router = APIRouter(prefix="/api/documents", tags=["documents"])
+
+
+def _select_documents(session_id: UUID):
+    return (
+        get_supabase()
+        .table("documents")
+        .select("*")
+        .eq("session_id", str(session_id))
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+
+def _select_document(document_id: UUID, session_id: UUID):
+    response = (
+        get_supabase()
+        .table("documents")
+        .select("id")
+        .eq("id", str(document_id))
+        .eq("session_id", str(session_id))
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def _delete_document(document_id: UUID):
+    # document_chunks cascades on document_id, so this clears both.
+    return (
+        get_supabase()
+        .table("documents")
+        .delete()
+        .eq("id", str(document_id))
+        .execute()
+    )
+
+
+@router.post("/", response_model=DocumentResponse)
+async def upload_document(
+    session_id: UUID = Query(...),
+    client_id: UUID = Query(...),
+    file: UploadFile = File(...),
+):
+    await require_session_owner(session_id, client_id)
+
+    filename = file.filename or "upload"
+    if not any(filename.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Accepted: {', '.join(sorted(SUPPORTED_EXTENSIONS))}",
+        )
+
+    raw = await file.read()
+    max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
+    if len(raw) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is larger than the {settings.MAX_UPLOAD_MB}MB limit.",
+        )
+    if not raw:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+
+    try:
+        document = await asyncio.to_thread(ingest_document, session_id, filename, raw)
+    except DocumentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return document
+
+
+@router.get("/", response_model=list[DocumentResponse])
+async def list_documents(session_id: UUID = Query(...), client_id: UUID = Query(...)):
+    await require_session_owner(session_id, client_id)
+    response = await asyncio.to_thread(_select_documents, session_id)
+    return response.data or []
+
+
+@router.delete("/{document_id}")
+async def delete_document(
+    document_id: UUID, session_id: UUID = Query(...), client_id: UUID = Query(...)
+):
+    await require_session_owner(session_id, client_id)
+    existing = await asyncio.to_thread(_select_document, document_id, session_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    await asyncio.to_thread(_delete_document, document_id)
+    return {"status": "deleted"}
+EOF_BACKEND_APP_ROUTERS_DOCUMENTS_PY_3C1F88
 
 # ---- backend/app/services/__init__.py ----
 touch backend/app/services/__init__.py
@@ -557,9 +789,12 @@ def get_llm() -> ChatOllama:
 
 
 def build_prompt() -> ChatPromptTemplate:
+    # {context} carries retrieved document excerpts and is empty for a plain
+    # chat turn. Values substituted into a template are not re-parsed, so
+    # retrieved code containing braces is safe here.
     return ChatPromptTemplate.from_messages(
         [
-            ("system", SYSTEM_PROMPT),
+            ("system", SYSTEM_PROMPT + "\n\n{context}"),
             MessagesPlaceholder(variable_name="history"),
             ("human", "{input}"),
         ]
@@ -577,16 +812,214 @@ def format_history(messages: list[dict]) -> list:
     return formatted
 
 
-async def stream_chat_response(user_input: str, history: list[dict]):
+async def stream_chat_response(user_input: str, history: list[dict], context: str = ""):
     """Yield response tokens as they arrive from the local Ollama model."""
     chain = build_prompt() | get_llm()
 
     async for chunk in chain.astream(
-        {"input": user_input, "history": format_history(history)}
+        {
+            "input": user_input,
+            "history": format_history(history),
+            "context": context,
+        }
     ):
         if chunk.content:
             yield chunk.content
 EOF_BACKEND_APP_SERVICES_LLM_SERVICE_PY_C10DA2
+
+# ---- backend/app/services/rag_service.py ----
+cat > backend/app/services/rag_service.py << 'EOF_BACKEND_APP_SERVICES_RAG_SERVICE_PY_098663'
+import io
+import uuid
+from typing import Iterable
+from uuid import UUID
+
+from langchain_ollama import OllamaEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from app.config import settings
+from app.database import get_supabase
+
+SUPPORTED_EXTENSIONS = {".txt", ".md", ".markdown", ".pdf"}
+
+
+class DocumentError(ValueError):
+    """Raised when an upload can't be turned into usable text."""
+
+
+def get_embeddings() -> OllamaEmbeddings:
+    return OllamaEmbeddings(
+        model=settings.OLLAMA_EMBED_MODEL, base_url=settings.OLLAMA_BASE_URL
+    )
+
+
+def extract_text(filename: str, raw: bytes) -> str:
+    """Pull plain text out of an upload, or explain why we can't."""
+    lower = filename.lower()
+
+    if lower.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:  # pragma: no cover
+            raise DocumentError("PDF support requires pypdf") from exc
+        try:
+            reader = PdfReader(io.BytesIO(raw))
+            pages = [page.extract_text() or "" for page in reader.pages]
+        except Exception as exc:
+            raise DocumentError(f"Could not read that PDF: {exc}") from exc
+        text = "\n\n".join(pages)
+        if not text.strip():
+            raise DocumentError(
+                "That PDF has no extractable text — it's probably a scan. "
+                "OCR it first, or upload a text version."
+            )
+        return text
+
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        # Don't silently mangle a binary file into garbage chunks.
+        raise DocumentError(
+            "That file isn't valid UTF-8 text. Supported types: "
+            + ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        )
+
+
+def chunk_text(text: str) -> list[str]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.CHUNK_SIZE,
+        chunk_overlap=settings.CHUNK_OVERLAP,
+        # Prefer splitting on paragraph, then line, then sentence boundaries,
+        # so chunks stay semantically coherent instead of cutting mid-word.
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    return [c for c in splitter.split_text(text) if c.strip()]
+
+
+def _insert_document(session_id: UUID, filename: str) -> dict:
+    response = (
+        get_supabase()
+        .table("documents")
+        .insert({"session_id": str(session_id), "filename": filename})
+        .execute()
+    )
+    if not response.data:
+        raise RuntimeError("Failed to create document row")
+    return response.data[0]
+
+
+def _insert_chunks(rows: Iterable[dict]) -> None:
+    get_supabase().table("document_chunks").insert(list(rows)).execute()
+
+
+def _set_chunk_count(document_id: str, count: int) -> None:
+    (
+        get_supabase()
+        .table("documents")
+        .update({"chunk_count": count})
+        .eq("id", document_id)
+        .execute()
+    )
+
+
+def _delete_document_row(document_id: str) -> None:
+    get_supabase().table("documents").delete().eq("id", document_id).execute()
+
+
+def ingest_document(session_id: UUID, filename: str, raw: bytes) -> dict:
+    """Chunk, embed, and store an uploaded file. Runs synchronously.
+
+    This blocks until every chunk is embedded, which is fine for the small
+    files this accepts. For large documents you'd hand this to a background
+    worker and report progress — see README.
+    """
+    text = extract_text(filename, raw)
+    chunks = chunk_text(text)
+    if not chunks:
+        raise DocumentError("That file appears to be empty.")
+
+    document = _insert_document(session_id, filename)
+    document_id = document["id"]
+
+    try:
+        vectors = get_embeddings().embed_documents(chunks)
+    except Exception as exc:
+        # Roll back the document row so a failed embed doesn't leave an
+        # orphaned "0 chunks" entry sitting in the sidebar.
+        _delete_document_row(document_id)
+        raise RuntimeError(
+            f"Could not reach the embedding model "
+            f"({settings.OLLAMA_EMBED_MODEL}). Run: "
+            f"ollama pull {settings.OLLAMA_EMBED_MODEL}\n  Underlying error: {exc}"
+        ) from exc
+
+    rows = [
+        {
+            "id": str(uuid.uuid4()),
+            "document_id": document_id,
+            "session_id": str(session_id),
+            "content": chunk,
+            "embedding": vector,
+            "metadata": {"filename": filename, "chunk_index": i},
+        }
+        for i, (chunk, vector) in enumerate(zip(chunks, vectors))
+    ]
+
+    try:
+        _insert_chunks(rows)
+    except Exception:
+        _delete_document_row(document_id)
+        raise
+
+    _set_chunk_count(document_id, len(rows))
+    document["chunk_count"] = len(rows)
+    return document
+
+
+def retrieve_context(session_id: UUID, query: str) -> list[dict]:
+    """Find chunks in this session relevant to the query.
+
+    Returns [] on any failure: retrieval is an enhancement, so a broken
+    embedding model should degrade to a normal chat turn, not a 500.
+    """
+    try:
+        vector = get_embeddings().embed_query(query)
+        response = (
+            get_supabase()
+            .rpc(
+                "match_documents",
+                {
+                    "query_embedding": vector,
+                    "match_session_id": str(session_id),
+                    "match_count": settings.RAG_TOP_K,
+                    "match_threshold": settings.RAG_MATCH_THRESHOLD,
+                },
+            )
+            .execute()
+        )
+        return response.data or []
+    except Exception as exc:
+        print(f"[rag] retrieval skipped: {exc}")
+        return []
+
+
+def format_context(matches: list[dict]) -> str:
+    """Render retrieved chunks as a block for the system prompt."""
+    if not matches:
+        return ""
+
+    parts = []
+    for match in matches:
+        filename = match.get("filename") or "document"
+        parts.append(f"--- from {filename} ---\n{match['content']}")
+
+    return (
+        "Use the following excerpts from the user's uploaded documents to "
+        "answer. If they don't contain the answer, say so plainly and answer "
+        "from your own knowledge instead — do not invent citations.\n\n"
+        + "\n\n".join(parts)
+    )
+EOF_BACKEND_APP_SERVICES_RAG_SERVICE_PY_098663
 
 # ---- backend/app/main.py ----
 cat > backend/app/main.py << 'EOF_BACKEND_APP_MAIN_PY_7E270C'
@@ -598,7 +1031,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import check_connection
-from app.routers import chat, sessions
+from app.routers import chat, documents, sessions
 
 
 @asynccontextmanager
@@ -608,7 +1041,10 @@ async def lifespan(app: FastAPI):
     # into a confusing 500 on someone's first message.
     settings.validate()
     await asyncio.to_thread(check_connection)
-    print(f"Config OK. Model: {settings.OLLAMA_MODEL} @ {settings.OLLAMA_BASE_URL}")
+    print(
+        f"Config OK. Chat model: {settings.OLLAMA_MODEL} | "
+        f"Embeddings: {settings.OLLAMA_EMBED_MODEL} @ {settings.OLLAMA_BASE_URL}"
+    )
     yield
 
 
@@ -623,6 +1059,7 @@ app.add_middleware(
 )
 
 app.include_router(chat.router)
+app.include_router(documents.router)
 app.include_router(sessions.router)
 
 
@@ -762,6 +1199,7 @@ EOF_FRONTEND_SRC_MAIN_JSX_9B052D
 cat > frontend/src/App.jsx << 'EOF_FRONTEND_SRC_APP_JSX_6C8DAC'
 import { useEffect } from 'react'
 import Sidebar from './components/Sidebar'
+import DocumentPanel from './components/DocumentPanel'
 import MessageList from './components/MessageList'
 import MessageInput from './components/MessageInput'
 import { useChat } from './hooks/useChat'
@@ -772,11 +1210,15 @@ export default function App() {
     sessions,
     activeSessionId,
     messages,
+    documents,
     isStreaming,
+    uploadState,
     loadSessions,
     createSession,
     loadMessages,
     deleteSession,
+    uploadDocument,
+    deleteDocument,
     sendMessage,
   } = useChat()
 
@@ -794,6 +1236,12 @@ export default function App() {
         onDeleteSession={deleteSession}
       />
       <div className="chat-canvas">
+        <DocumentPanel
+          documents={documents}
+          uploadState={uploadState}
+          onUpload={uploadDocument}
+          onDelete={deleteDocument}
+        />
         <MessageList messages={messages} isStreaming={isStreaming} />
         <MessageInput onSend={sendMessage} disabled={isStreaming} />
       </div>
@@ -827,7 +1275,9 @@ export function useChat() {
   const [sessions, setSessions] = useState([])
   const [activeSessionId, setActiveSessionId] = useState(null)
   const [messages, setMessages] = useState([])
+  const [documents, setDocuments] = useState([])
   const [isStreaming, setIsStreaming] = useState(false)
+  const [uploadState, setUploadState] = useState({ busy: false, error: null })
   const streamingContentRef = useRef('')
 
   const loadSessions = useCallback(async () => {
@@ -835,6 +1285,19 @@ export function useChat() {
     const res = await fetch(`${API_BASE}/api/sessions/?client_id=${clientId}`)
     if (!res.ok) return
     setSessions(await res.json())
+  }, [])
+
+  const loadDocuments = useCallback(async (sessionId) => {
+    if (!sessionId) {
+      setDocuments([])
+      return
+    }
+    const clientId = getClientId()
+    const res = await fetch(
+      `${API_BASE}/api/documents/?session_id=${sessionId}&client_id=${clientId}`,
+    )
+    if (!res.ok) return
+    setDocuments(await res.json())
   }, [])
 
   const createSession = useCallback(async () => {
@@ -848,18 +1311,24 @@ export function useChat() {
     setSessions((prev) => [session, ...prev])
     setActiveSessionId(session.id)
     setMessages([])
+    setDocuments([])
+    setUploadState({ busy: false, error: null })
     return session.id
   }, [])
 
-  const loadMessages = useCallback(async (sessionId) => {
-    const clientId = getClientId()
-    setActiveSessionId(sessionId)
-    const res = await fetch(
-      `${API_BASE}/api/sessions/${sessionId}/messages?client_id=${clientId}`,
-    )
-    if (!res.ok) return
-    setMessages(await res.json())
-  }, [])
+  const loadMessages = useCallback(
+    async (sessionId) => {
+      const clientId = getClientId()
+      setActiveSessionId(sessionId)
+      setUploadState({ busy: false, error: null })
+      const res = await fetch(
+        `${API_BASE}/api/sessions/${sessionId}/messages?client_id=${clientId}`,
+      )
+      if (res.ok) setMessages(await res.json())
+      loadDocuments(sessionId)
+    },
+    [loadDocuments],
+  )
 
   const deleteSession = useCallback(
     async (sessionId) => {
@@ -873,7 +1342,53 @@ export function useChat() {
       if (sessionId === activeSessionId) {
         setActiveSessionId(null)
         setMessages([])
+        setDocuments([])
       }
+    },
+    [activeSessionId],
+  )
+
+  // Uploading is synchronous on the backend: it chunks, embeds every chunk,
+  // and only then responds. Keep the button disabled for the whole round trip.
+  const uploadDocument = useCallback(
+    async (file) => {
+      let sessionId = activeSessionId
+      if (!sessionId) sessionId = await createSession()
+
+      const clientId = getClientId()
+      const form = new FormData()
+      form.append('file', file)
+
+      setUploadState({ busy: true, error: null })
+      try {
+        const res = await fetch(
+          `${API_BASE}/api/documents/?session_id=${sessionId}&client_id=${clientId}`,
+          { method: 'POST', body: form },
+        )
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}))
+          throw new Error(detail.detail || `Upload failed (${res.status})`)
+        }
+        const doc = await res.json()
+        setDocuments((prev) => [doc, ...prev])
+        setUploadState({ busy: false, error: null })
+      } catch (err) {
+        setUploadState({ busy: false, error: err.message })
+      }
+    },
+    [activeSessionId, createSession],
+  )
+
+  const deleteDocument = useCallback(
+    async (documentId) => {
+      if (!activeSessionId) return
+      const clientId = getClientId()
+      const res = await fetch(
+        `${API_BASE}/api/documents/${documentId}?session_id=${activeSessionId}&client_id=${clientId}`,
+        { method: 'DELETE' },
+      )
+      if (!res.ok) return
+      setDocuments((prev) => prev.filter((d) => d.id !== documentId))
     },
     [activeSessionId],
   )
@@ -905,13 +1420,13 @@ export function useChat() {
       setMessages((prev) => [
         ...prev,
         userMsg,
-        { id: assistantId, role: 'assistant', content: '' },
+        { id: assistantId, role: 'assistant', content: '', sources: [] },
       ])
       setIsStreaming(true)
 
-      const updateAssistant = (text) =>
+      const patchAssistant = (patch) =>
         setMessages((prev) =>
-          prev.map((m) => (m.id === assistantId ? { ...m, content: text } : m)),
+          prev.map((m) => (m.id === assistantId ? { ...m, ...patch } : m)),
         )
 
       try {
@@ -958,21 +1473,23 @@ export function useChat() {
 
             if (eventType === 'token') {
               streamingContentRef.current += parsed.content
-              updateAssistant(streamingContentRef.current)
+              patchAssistant({ content: streamingContentRef.current })
+            } else if (eventType === 'sources') {
+              patchAssistant({ sources: parsed.sources })
             } else if (eventType === 'done') {
               syncSessionAfterTurn(sessionId, parsed.title)
             } else if (eventType === 'error') {
               streamingContentRef.current +=
                 `\n\n*The local model didn't respond: ${parsed.error}. ` +
                 'Check that Ollama is running.*'
-              updateAssistant(streamingContentRef.current)
+              patchAssistant({ content: streamingContentRef.current })
             }
           }
         }
       } catch (err) {
-        updateAssistant(
-          `*Couldn't reach the backend: ${err.message}. Is the API running?*`,
-        )
+        patchAssistant({
+          content: `*Couldn't reach the backend: ${err.message}. Is the API running?*`,
+        })
       } finally {
         setIsStreaming(false)
       }
@@ -984,11 +1501,15 @@ export function useChat() {
     sessions,
     activeSessionId,
     messages,
+    documents,
     isStreaming,
+    uploadState,
     loadSessions,
     createSession,
     loadMessages,
     deleteSession,
+    uploadDocument,
+    deleteDocument,
     sendMessage,
   }
 }
@@ -1043,6 +1564,21 @@ import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Code, Pre } from './CodeBlock'
 
+function Sources({ sources }) {
+  if (!sources?.length) return null
+  return (
+    <div className="sources">
+      <span className="sources-label">based on</span>
+      {sources.map((s, i) => (
+        <span className="source-chip" key={`${s.filename}-${i}`}>
+          {s.filename}
+          <span className="source-score">{s.similarity}</span>
+        </span>
+      ))}
+    </div>
+  )
+}
+
 export default function MessageList({ messages, isStreaming }) {
   const bottomRef = useRef(null)
 
@@ -1054,7 +1590,10 @@ export default function MessageList({ messages, isStreaming }) {
     return (
       <div className="message-list">
         <div className="empty-state">
-          <p>Ask anything — the model runs locally, nothing leaves this machine.</p>
+          <p>
+            Ask anything — the model runs locally, nothing leaves this machine.
+            Attach a document to ground answers in it.
+          </p>
         </div>
       </div>
     )
@@ -1064,10 +1603,13 @@ export default function MessageList({ messages, isStreaming }) {
     <div className="message-list">
       {messages.map((msg, i) => {
         const isLast = i === messages.length - 1
-        const isPending = isLast && msg.role === 'assistant' && isStreaming && !msg.content
+        const isPending =
+          isLast && msg.role === 'assistant' && isStreaming && !msg.content
         return (
           <div key={msg.id} className={`message message-${msg.role}`}>
-            <div className="message-role">{msg.role === 'user' ? 'you' : 'assistant'}</div>
+            <div className="message-role">
+              {msg.role === 'user' ? 'you' : 'assistant'}
+            </div>
             <div className="message-content">
               {isPending ? (
                 <span className="thinking-dots" aria-label="Waiting for response">
@@ -1076,9 +1618,15 @@ export default function MessageList({ messages, isStreaming }) {
                   <span />
                 </span>
               ) : (
-                <Markdown remarkPlugins={[remarkGfm]} components={{ code: Code, pre: Pre }}>
-                  {msg.content}
-                </Markdown>
+                <>
+                  <Markdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{ code: Code, pre: Pre }}
+                  >
+                    {msg.content}
+                  </Markdown>
+                  <Sources sources={msg.sources} />
+                </>
               )}
             </div>
           </div>
@@ -1171,6 +1719,66 @@ export default function Sidebar({
   )
 }
 EOF_FRONTEND_SRC_COMPONENTS_SIDEBAR_JSX_2B268A
+
+# ---- frontend/src/components/DocumentPanel.jsx ----
+cat > frontend/src/components/DocumentPanel.jsx << 'EOF_FRONTEND_SRC_COMPONENTS_DOCUMENTPANEL_JSX_39981E'
+import { useRef } from 'react'
+
+export default function DocumentPanel({
+  documents,
+  uploadState,
+  onUpload,
+  onDelete,
+}) {
+  const inputRef = useRef(null)
+
+  const pick = (e) => {
+    const file = e.target.files?.[0]
+    if (file) onUpload(file)
+    e.target.value = '' // let the same file be re-picked after a failure
+  }
+
+  return (
+    <div className="doc-panel">
+      <div className="doc-row">
+        <button
+          className="doc-attach"
+          onClick={() => inputRef.current?.click()}
+          disabled={uploadState.busy}
+        >
+          {uploadState.busy ? 'Embedding…' : '+ Attach document'}
+        </button>
+
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".txt,.md,.markdown,.pdf"
+          onChange={pick}
+          hidden
+        />
+
+        {documents.map((doc) => (
+          <span className="doc-chip" key={doc.id}>
+            <span className="doc-name" title={doc.filename}>
+              {doc.filename}
+            </span>
+            <span className="doc-count">{doc.chunk_count}</span>
+            <button
+              className="doc-remove"
+              onClick={() => onDelete(doc.id)}
+              aria-label={`Remove ${doc.filename}`}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+
+      {uploadState.error && <div className="doc-error">{uploadState.error}</div>}
+    </div>
+  )
+}
+EOF_FRONTEND_SRC_COMPONENTS_DOCUMENTPANEL_JSX_39981E
 
 # ---- frontend/src/styles/App.css ----
 cat > frontend/src/styles/App.css << 'EOF_FRONTEND_SRC_STYLES_APP_CSS_52B15A'
@@ -1394,6 +2002,126 @@ cat > frontend/src/styles/App.css << 'EOF_FRONTEND_SRC_STYLES_APP_CSS_52B15A'
   40% { opacity: 1; }
 }
 
+/* ---------- document panel ---------- */
+
+.doc-panel {
+  border-bottom: 1px solid var(--border);
+  padding: 10px 24px;
+  max-width: 720px;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.doc-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.doc-attach {
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-family: var(--font-mono);
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.doc-attach:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.doc-attach:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.doc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 6px 4px 11px;
+  font-size: 0.78rem;
+  font-family: var(--font-mono);
+  color: var(--text);
+  max-width: 220px;
+}
+
+.doc-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-count {
+  color: var(--accent-quiet);
+  flex-shrink: 0;
+}
+
+.doc-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 0 3px;
+  flex-shrink: 0;
+}
+
+.doc-remove:hover {
+  color: var(--text);
+}
+
+.doc-error {
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: var(--accent);
+  line-height: 1.5;
+}
+
+/* ---------- retrieval sources ---------- */
+
+.sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.sources-label {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.source-score {
+  color: var(--accent-quiet);
+}
+
 /* ---------- input bar ---------- */
 
 .message-input {
@@ -1483,9 +2211,14 @@ cat > frontend/src/styles/App.css << 'EOF_FRONTEND_SRC_STYLES_APP_CSS_52B15A'
   }
 
   .message-list,
-  .message-input {
+  .message-input,
+  .doc-panel {
     padding-left: 14px;
     padding-right: 14px;
+  }
+
+  .doc-chip {
+    max-width: 150px;
   }
 }
 EOF_FRONTEND_SRC_STYLES_APP_CSS_52B15A
@@ -1513,7 +2246,8 @@ cat > README.md << 'EOF_README_MD_8EC9A0'
 # Local Coding Assistant
 
 A chatbot backed by a local Ollama model (`qwen2.5-coder:7b`), FastAPI, LangChain,
-Supabase (Postgres), and React.
+Supabase (Postgres + pgvector), and React. Includes document-grounded answers (RAG)
+using local embeddings — nothing is sent to an external API.
 
 ## Architecture
 
@@ -1539,9 +2273,43 @@ Supabase (Postgres), and React.
 - **Startup validation**: config and database connectivity are checked in the
   FastAPI lifespan hook, so a missing key or an un-migrated database fails
   loudly at boot instead of becoming a confusing 500 on the first message.
-- **RAG**: not implemented. `supabase/schema.sql` includes a `document_chunks`
-  table and a `match_documents` function so it's schema-ready if you want to
-  add document upload + embeddings later.
+
+## RAG
+
+Upload a `.txt`, `.md`, or `.pdf` and answers in that session get grounded in it.
+
+**Ingest** (`POST /api/documents/`): extract text → split with
+`RecursiveCharacterTextSplitter` (`CHUNK_SIZE`/`CHUNK_OVERLAP`, preferring
+paragraph then line then sentence boundaries) → embed every chunk with
+`nomic-embed-text` via Ollama → store vectors in `document_chunks`.
+
+**Retrieve** (on each chat turn): the session is checked for documents first,
+so a plain chat session pays no embedding cost at all. If documents exist, the
+question is embedded and passed to the `match_documents` SQL function, which
+does a cosine-similarity search scoped to that session and filtered by
+`RAG_MATCH_THRESHOLD`. Matches are formatted into the `{context}` slot of the
+system prompt.
+
+**Grounding**: the prompt instructs the model to say so plainly when the
+excerpts don't contain the answer, rather than inventing citations. The UI
+shows which files were used, with similarity scores, under each answer.
+
+Design decisions worth knowing:
+
+- **Documents are scoped per session**, matching the schema. Uploading in one
+  chat doesn't leak context into another.
+- **Retrieval failures degrade, they don't 500.** If the embedding model is
+  unreachable, `retrieve_context` logs and returns `[]`, and the turn proceeds
+  as a normal chat. A missing RAG feature shouldn't take the chatbot down.
+- **Failed ingests roll back.** If embedding dies partway, the `documents` row
+  is deleted so you don't get a phantom "0 chunks" entry in the UI.
+- **Braces in retrieved text are safe.** Values substituted into a LangChain
+  prompt template aren't re-parsed, so a chunk containing `{...}` (i.e. most
+  code) won't break formatting. Verified, not assumed.
+- **Embedding dimensions are load-bearing.** `vector(768)` matches
+  `nomic-embed-text`. Switching embedding models means changing the dimension
+  in `schema.sql` *and* re-uploading every document — vectors from different
+  models aren't comparable.
 
 ## Security
 
@@ -1550,7 +2318,7 @@ browser generates and sends; anyone who obtains it can impersonate that
 client. What it does buy you:
 
 - A caller who guesses or scrapes a session UUID cannot read, write to, or
-  delete that session without also knowing the owner's `client_id`.
+  delete that session — or its documents — without the owner's `client_id`.
 - Session-scoped endpoints return `404` rather than `403` on a mismatch, so
   they don't confirm whether a given session exists.
 
@@ -1562,16 +2330,17 @@ and turn on Row Level Security so the database enforces ownership too.
 
 - Python 3.10+
 - Node.js 18+
-- [Ollama](https://ollama.com) installed and running, with the model pulled:
+- [Ollama](https://ollama.com) running, with both models pulled:
   ```
   ollama pull qwen2.5-coder:7b
+  ollama pull nomic-embed-text
   ```
 - A Supabase project (free tier is fine)
 
 ## Setup
 
 **1. Database** — open your Supabase project's SQL editor and run
-`supabase/schema.sql`.
+`supabase/schema.sql`. It's idempotent, so re-run it safely after updates.
 
 **2. Backend**
 
@@ -1599,6 +2368,16 @@ Open the printed local URL (typically `http://localhost:5173`).
 
 ## Notes / trade-offs
 
+- **Uploads are synchronous.** The request doesn't return until every chunk is
+  embedded, which is why `MAX_UPLOAD_MB` defaults to 5. For larger corpora,
+  hand ingestion to a background worker (Celery, ARQ, or a Supabase edge
+  function) and poll for status.
+- **Scanned PDFs won't work.** Text extraction needs an actual text layer; the
+  API returns a clear message rather than silently embedding empty chunks. OCR
+  first if you need those.
+- **IVFFlat index needs data.** The vector index only helps past a few thousand
+  rows; on a small demo set Postgres may sequential-scan, which is correct and
+  fast enough.
 - **SSE line endings**: `sse-starlette` emits CRLF, so the frontend parser
   splits on `/\r?\n\r?\n/` rather than `\n\n`. Splitting on `\n\n` alone
   silently yields zero tokens — worth knowing if you adapt this code.
@@ -1607,9 +2386,6 @@ Open the printed local URL (typically `http://localhost:5173`).
   ` ``` ` arrives. Cosmetic only, not a functional bug.
 - **Rate limiting**: intentionally left out. In production, add something
   like `slowapi` or a Redis-backed limiter, and log token counts per session.
-- **Sidebar sync**: the backend echoes the auto-generated session title on the
-  SSE `done` event, so the sidebar renames itself the moment a first turn
-  finishes — no refetch, no reload.
 - **No RLS**: the backend uses the service_role key and enforces ownership in
   application code. Row Level Security is the right second layer once there's
   real auth.

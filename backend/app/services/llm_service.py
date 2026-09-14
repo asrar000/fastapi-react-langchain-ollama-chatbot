@@ -20,9 +20,12 @@ def get_llm() -> ChatOllama:
 
 
 def build_prompt() -> ChatPromptTemplate:
+    # {context} carries retrieved document excerpts and is empty for a plain
+    # chat turn. Values substituted into a template are not re-parsed, so
+    # retrieved code containing braces is safe here.
     return ChatPromptTemplate.from_messages(
         [
-            ("system", SYSTEM_PROMPT),
+            ("system", SYSTEM_PROMPT + "\n\n{context}"),
             MessagesPlaceholder(variable_name="history"),
             ("human", "{input}"),
         ]
@@ -40,12 +43,16 @@ def format_history(messages: list[dict]) -> list:
     return formatted
 
 
-async def stream_chat_response(user_input: str, history: list[dict]):
+async def stream_chat_response(user_input: str, history: list[dict], context: str = ""):
     """Yield response tokens as they arrive from the local Ollama model."""
     chain = build_prompt() | get_llm()
 
     async for chunk in chain.astream(
-        {"input": user_input, "history": format_history(history)}
+        {
+            "input": user_input,
+            "history": format_history(history),
+            "context": context,
+        }
     ):
         if chunk.content:
             yield chunk.content

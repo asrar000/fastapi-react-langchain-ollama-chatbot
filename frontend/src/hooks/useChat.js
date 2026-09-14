@@ -7,7 +7,9 @@ export function useChat() {
   const [sessions, setSessions] = useState([])
   const [activeSessionId, setActiveSessionId] = useState(null)
   const [messages, setMessages] = useState([])
+  const [documents, setDocuments] = useState([])
   const [isStreaming, setIsStreaming] = useState(false)
+  const [uploadState, setUploadState] = useState({ busy: false, error: null })
   const streamingContentRef = useRef('')
 
   const loadSessions = useCallback(async () => {
@@ -15,6 +17,19 @@ export function useChat() {
     const res = await fetch(`${API_BASE}/api/sessions/?client_id=${clientId}`)
     if (!res.ok) return
     setSessions(await res.json())
+  }, [])
+
+  const loadDocuments = useCallback(async (sessionId) => {
+    if (!sessionId) {
+      setDocuments([])
+      return
+    }
+    const clientId = getClientId()
+    const res = await fetch(
+      `${API_BASE}/api/documents/?session_id=${sessionId}&client_id=${clientId}`,
+    )
+    if (!res.ok) return
+    setDocuments(await res.json())
   }, [])
 
   const createSession = useCallback(async () => {
@@ -28,18 +43,24 @@ export function useChat() {
     setSessions((prev) => [session, ...prev])
     setActiveSessionId(session.id)
     setMessages([])
+    setDocuments([])
+    setUploadState({ busy: false, error: null })
     return session.id
   }, [])
 
-  const loadMessages = useCallback(async (sessionId) => {
-    const clientId = getClientId()
-    setActiveSessionId(sessionId)
-    const res = await fetch(
-      `${API_BASE}/api/sessions/${sessionId}/messages?client_id=${clientId}`,
-    )
-    if (!res.ok) return
-    setMessages(await res.json())
-  }, [])
+  const loadMessages = useCallback(
+    async (sessionId) => {
+      const clientId = getClientId()
+      setActiveSessionId(sessionId)
+      setUploadState({ busy: false, error: null })
+      const res = await fetch(
+        `${API_BASE}/api/sessions/${sessionId}/messages?client_id=${clientId}`,
+      )
+      if (res.ok) setMessages(await res.json())
+      loadDocuments(sessionId)
+    },
+    [loadDocuments],
+  )
 
   const deleteSession = useCallback(
     async (sessionId) => {
@@ -53,7 +74,53 @@ export function useChat() {
       if (sessionId === activeSessionId) {
         setActiveSessionId(null)
         setMessages([])
+        setDocuments([])
       }
+    },
+    [activeSessionId],
+  )
+
+  // Uploading is synchronous on the backend: it chunks, embeds every chunk,
+  // and only then responds. Keep the button disabled for the whole round trip.
+  const uploadDocument = useCallback(
+    async (file) => {
+      let sessionId = activeSessionId
+      if (!sessionId) sessionId = await createSession()
+
+      const clientId = getClientId()
+      const form = new FormData()
+      form.append('file', file)
+
+      setUploadState({ busy: true, error: null })
+      try {
+        const res = await fetch(
+          `${API_BASE}/api/documents/?session_id=${sessionId}&client_id=${clientId}`,
+          { method: 'POST', body: form },
+        )
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}))
+          throw new Error(detail.detail || `Upload failed (${res.status})`)
+        }
+        const doc = await res.json()
+        setDocuments((prev) => [doc, ...prev])
+        setUploadState({ busy: false, error: null })
+      } catch (err) {
+        setUploadState({ busy: false, error: err.message })
+      }
+    },
+    [activeSessionId, createSession],
+  )
+
+  const deleteDocument = useCallback(
+    async (documentId) => {
+      if (!activeSessionId) return
+      const clientId = getClientId()
+      const res = await fetch(
+        `${API_BASE}/api/documents/${documentId}?session_id=${activeSessionId}&client_id=${clientId}`,
+        { method: 'DELETE' },
+      )
+      if (!res.ok) return
+      setDocuments((prev) => prev.filter((d) => d.id !== documentId))
     },
     [activeSessionId],
   )
@@ -85,13 +152,13 @@ export function useChat() {
       setMessages((prev) => [
         ...prev,
         userMsg,
-        { id: assistantId, role: 'assistant', content: '' },
+        { id: assistantId, role: 'assistant', content: '', sources: [] },
       ])
       setIsStreaming(true)
 
-      const updateAssistant = (text) =>
+      const patchAssistant = (patch) =>
         setMessages((prev) =>
-          prev.map((m) => (m.id === assistantId ? { ...m, content: text } : m)),
+          prev.map((m) => (m.id === assistantId ? { ...m, ...patch } : m)),
         )
 
       try {
@@ -138,21 +205,23 @@ export function useChat() {
 
             if (eventType === 'token') {
               streamingContentRef.current += parsed.content
-              updateAssistant(streamingContentRef.current)
+              patchAssistant({ content: streamingContentRef.current })
+            } else if (eventType === 'sources') {
+              patchAssistant({ sources: parsed.sources })
             } else if (eventType === 'done') {
               syncSessionAfterTurn(sessionId, parsed.title)
             } else if (eventType === 'error') {
               streamingContentRef.current +=
                 `\n\n*The local model didn't respond: ${parsed.error}. ` +
                 'Check that Ollama is running.*'
-              updateAssistant(streamingContentRef.current)
+              patchAssistant({ content: streamingContentRef.current })
             }
           }
         }
       } catch (err) {
-        updateAssistant(
-          `*Couldn't reach the backend: ${err.message}. Is the API running?*`,
-        )
+        patchAssistant({
+          content: `*Couldn't reach the backend: ${err.message}. Is the API running?*`,
+        })
       } finally {
         setIsStreaming(false)
       }
@@ -164,11 +233,15 @@ export function useChat() {
     sessions,
     activeSessionId,
     messages,
+    documents,
     isStreaming,
+    uploadState,
     loadSessions,
     createSession,
     loadMessages,
     deleteSession,
+    uploadDocument,
+    deleteDocument,
     sendMessage,
   }
 }

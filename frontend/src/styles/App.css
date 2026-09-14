@@ -218,6 +218,126 @@
   40% { opacity: 1; }
 }
 
+/* ---------- document panel ---------- */
+
+.doc-panel {
+  border-bottom: 1px solid var(--border);
+  padding: 10px 24px;
+  max-width: 720px;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.doc-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.doc-attach {
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-family: var(--font-mono);
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.doc-attach:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.doc-attach:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.doc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 6px 4px 11px;
+  font-size: 0.78rem;
+  font-family: var(--font-mono);
+  color: var(--text);
+  max-width: 220px;
+}
+
+.doc-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-count {
+  color: var(--accent-quiet);
+  flex-shrink: 0;
+}
+
+.doc-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 0 3px;
+  flex-shrink: 0;
+}
+
+.doc-remove:hover {
+  color: var(--text);
+}
+
+.doc-error {
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: var(--accent);
+  line-height: 1.5;
+}
+
+/* ---------- retrieval sources ---------- */
+
+.sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.sources-label {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.source-score {
+  color: var(--accent-quiet);
+}
+
 /* ---------- input bar ---------- */
 
 .message-input {
@@ -307,8 +427,13 @@
   }
 
   .message-list,
-  .message-input {
+  .message-input,
+  .doc-panel {
     padding-left: 14px;
     padding-right: 14px;
+  }
+
+  .doc-chip {
+    max-width: 150px;
   }
 }

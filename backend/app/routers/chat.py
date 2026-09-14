@@ -9,6 +9,7 @@ from app.database import get_supabase
 from app.models import ChatRequest
 from app.services.llm_service import stream_chat_response
 from app.services.memory_service import get_windowed_history
+from app.services.rag_service import format_context, retrieve_context
 from app.services.session_service import require_session_owner
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -37,6 +38,18 @@ def _touch_session(session_id: str, title: str | None = None):
     )
 
 
+def _has_documents(session_id: str) -> bool:
+    response = (
+        get_supabase()
+        .table("documents")
+        .select("id")
+        .eq("session_id", session_id)
+        .limit(1)
+        .execute()
+    )
+    return bool(response.data)
+
+
 def _title_from_first_message(message: str) -> str:
     text = message.strip().replace("\n", " ")
     return text[:50] + ("..." if len(text) > 50 else "")
@@ -56,6 +69,23 @@ async def chat_stream(payload: ChatRequest):
     history = await asyncio.to_thread(get_windowed_history, payload.session_id)
     is_first_message = len(history) == 0
 
+    # Only pay the embedding round-trip if this session actually has
+    # documents; a plain chat session skips retrieval entirely.
+    matches = []
+    if await asyncio.to_thread(_has_documents, session_id):
+        matches = await asyncio.to_thread(
+            retrieve_context, payload.session_id, user_message
+        )
+    context = format_context(matches)
+
+    sources = [
+        {
+            "filename": m.get("filename") or "document",
+            "similarity": round(float(m.get("similarity", 0)), 3),
+        }
+        for m in matches
+    ]
+
     # Store the user message before calling the LLM. If the local Ollama
     # call fails or the stream dies halfway, the prompt is already durable.
     await asyncio.to_thread(_insert_message, session_id, "user", user_message)
@@ -67,7 +97,11 @@ async def chat_stream(payload: ChatRequest):
     async def event_generator():
         full_response = ""
         try:
-            async for token in stream_chat_response(user_message, history):
+            # Tell the UI which chunks were used before tokens start arriving.
+            if sources:
+                yield {"event": "sources", "data": json.dumps({"sources": sources})}
+
+            async for token in stream_chat_response(user_message, history, context):
                 full_response += token
                 yield {"event": "token", "data": json.dumps({"content": token})}
 
